@@ -1,15 +1,16 @@
 FROM node:22-alpine
 
-# Install system dependencies: ffmpeg, python3, pip
+# Install system dependencies: ffmpeg, python3, py3-pip
 RUN apk add --no-cache \
     ffmpeg \
     python3 \
     py3-pip
 
-# Set PATH to include /usr/local/bin
-ENV PATH="/usr/local/bin:$PATH"
+# Create and activate a Python virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Install yt-dlp via pip for better compatibility
+# Install yt-dlp in the virtual environment
 RUN pip install yt-dlp \
     && yt-dlp --version
 
