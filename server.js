@@ -1,13 +1,12 @@
 import express from 'express';
-import { spawn, execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
 import sqlite3 from 'sqlite3';
 import winston from 'winston';
-import fs from 'node:fs/promises';
-import path from 'node:path';
+import puppeteer from 'puppeteer';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -17,18 +16,22 @@ const PORT = process.env.PORT || 3000;
 const logger = winston.createLogger({
   transports: [
     new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'browser.log', level: 'info' }),
     new winston.transports.Console(),
   ],
 });
 
-// Log yt-dlp and ffmpeg versions at startup
-execFile('/opt/venv/bin/yt-dlp', ['--version'], (err, stdout, stderr) => {
-  if (err) logger.error(`yt-dlp version check failed: ${stderr}`);
-  else logger.info(`yt-dlp version: ${stdout.trim()}`);
-});
-execFile('ffmpeg', ['-version'], (err, stdout, stderr) => {
-  if (err) logger.error(`ffmpeg version check failed: ${stderr}`);
-  else logger.info(`ffmpeg version: ${stdout.split('\n')[0].trim()}`);
+// Proxy configuration (optional; recommended)
+const PROXY_LIST = process.env.PROXY_LIST || null; // e.g., 'http://username:password@brd.superproxy.io:22225'
+const MAX_RETRIES = 3;
+const RETRY_BACKOFF_MS = 1000;
+
+// Browser performance tracking
+let browserStats = { successes: 0, failures: 0 };
+
+// Log ffmpeg version
+spawn('ffmpeg', ['-version']).stdout.on('data', (data) => {
+  logger.info(`ffmpeg version: ${data.toString().split('\n')[0].trim()}`);
 });
 
 // Initialize SQLite
@@ -48,7 +51,7 @@ app.use(express.json());
 
 const jobs = new Map();
 
-// Global error handler to prevent crashes
+// Global error handler
 process.on('uncaughtException', (err) => {
   logger.error(`Uncaught Exception: ${err.message}`);
 });
@@ -58,7 +61,6 @@ const cleanupJob = (jobId) => {
   const job = jobs.get(jobId);
   if (job) {
     job.emitter.removeAllListeners();
-    if (job.ytdlp) job.ytdlp.kill();
     if (job.ffmpeg) job.ffmpeg.kill();
     jobs.delete(jobId);
     db.run('DELETE FROM jobs WHERE id = ?', [jobId], (err) => {
@@ -77,36 +79,84 @@ const isValidUrl = (url) => {
   }
 };
 
-// Fetch title using yt-dlp
-const getTitle = (url, cookies) =>
-  new Promise(async (resolve) => {
-    const cleanUrl = url.split('&')[0]; // Remove playlist parameters
-    const args = ['-j', cleanUrl];
-    if (cookies) {
-      const cookieFile = path.join('/tmp', `cookies_${uuidv4()}.txt`);
-      try {
-        await fs.writeFile(cookieFile, cookies);
-        args.push('--cookies', cookieFile);
-      } catch (e) {
-        logger.error(`Failed to write cookies file: ${e.message}`);
-      }
-    }
-    execFile('/opt/venv/bin/yt-dlp', args, async (err, stdout, stderr) => {
-      if (cookies) await fs.unlink(cookieFile).catch(() => {});
-      if (err) {
-        logger.error(`yt-dlp title fetch error: ${stderr}`);
-        return resolve({ title: 'download', error: stderr });
-      }
-      try {
-        const info = JSON.parse(stdout);
-        const title = info.title?.replace(/[^a-zA-Z0-9 ]/g, '').substring(0, 50) || 'download';
-        resolve({ title, error: null });
-      } catch (e) {
-        logger.error(`JSON parse error: ${e.message}`);
-        resolve({ title: 'download', error: e.message });
+// Fetch title and stream URL with Puppeteer
+const getStreamInfo = async (url, retryCount = 0) => {
+  if (retryCount >= MAX_RETRIES) {
+    browserStats.failures++;
+    logger.info(`Browser stats: ${JSON.stringify(browserStats)}`);
+    return { title: 'download', streamUrl: null, error: 'Failed to fetch video after retries. Try again later.' };
+  }
+
+  const proxies = PROXY_LIST ? PROXY_LIST.split(',') : [null];
+  const proxy = proxies[retryCount % proxies.length];
+  logger.info(`Attempting stream fetch with ${proxy ? `proxy: ${proxy}` : 'no proxy'} (retry ${retryCount + 1}/${MAX_RETRIES})`);
+
+  let browser;
+  try {
+    const browserArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-infobars',
+    ];
+    if (proxy) browserArgs.push(`--proxy-server=${proxy}`);
+    browser = await puppeteer.launch({
+      executablePath: '/usr/bin/chromium-browser',
+      headless: 'new',
+      args: browserArgs,
+    });
+    const page = await browser.newPage();
+
+    // Mimic real user
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1280, height: 720 });
+
+    // Disable unnecessary resources
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
       }
     });
-  });
+
+    // Navigate to YouTube video
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Extract title
+    const title = await page.evaluate(() => {
+      const titleElement = document.querySelector('h1 yt-formatted-string');
+      return titleElement ? titleElement.textContent.replace(/[^a-zA-Z0-9 ]/g, '').substring(0, 50) : 'download';
+    });
+
+    // Extract stream URL (try HLS or direct video source)
+    const streamUrl = await page.evaluate(() => {
+      const player = document.querySelector('video');
+      return player ? player.src : null;
+    });
+
+    if (!streamUrl) {
+      throw new Error('Could not extract stream URL');
+    }
+
+    await browser.close();
+    browserStats.successes++;
+    logger.info(`Browser stats: ${JSON.stringify(browserStats)}`);
+    return { title, streamUrl, error: null };
+  } catch (e) {
+    logger.error(`Puppeteer error (retry ${retryCount + 1}): ${e.message}`);
+    if (browser) await browser.close();
+    if (e.message.includes('net::ERR_BLOCKED_BY_CLIENT') || e.message.includes('Timeout') || e.message.includes('Navigation timeout')) {
+      return new Promise((resolve) => {
+        setTimeout(() => resolve(getStreamInfo(url, retryCount + 1)), RETRY_BACKOFF_MS * Math.pow(2, retryCount));
+      });
+    }
+    browserStats.failures++;
+    return { title: 'download', streamUrl: null, error: e.message };
+  }
+};
 
 // Health check
 app.get('/', (req, res) => {
@@ -115,7 +165,7 @@ app.get('/', (req, res) => {
 
 // Start download
 app.post('/start-download', async (req, res) => {
-  const { url, format: reqFormat, cookies } = req.body;
+  const { url, format: reqFormat } = req.body;
   const format = (reqFormat || 'mp3').toLowerCase();
 
   if (!isValidUrl(url)) return res.status(400).json({ error: 'Invalid YouTube URL' });
@@ -123,9 +173,9 @@ app.post('/start-download', async (req, res) => {
 
   const jobId = uuidv4();
   const emitter = new EventEmitter();
-  const { title, error: titleError } = await getTitle(url, cookies);
-  if (titleError && titleError.includes('Sign in to confirm')) {
-    return res.status(403).json({ error: 'Authentication required. Please provide valid YouTube cookies.' });
+  const { title, streamUrl, error: streamError } = await getStreamInfo(url);
+  if (streamError) {
+    return res.status(503).json({ error: 'Video temporarily unavailable. Please try again later.' });
   }
 
   db.run(
@@ -139,50 +189,7 @@ app.post('/start-download', async (req, res) => {
       jobs.set(jobId, { emitter, status: 'initializing', progress: 0, error: null, title, format });
       res.json({ jobId, title });
 
-      const cleanUrl = url.split('&')[0];
-      const ytdlpArgs = [
-        '-f',
-        format === 'mp3'
-          ? 'bestaudio'
-          : 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        '-o',
-        '-',
-        cleanUrl,
-      ];
-      if (cookies) {
-        const cookieFile = path.join('/tmp', `cookies_${uuidv4()}.txt`);
-        fs.writeFile(cookieFile, cookies).then(() => {
-          ytdlpArgs.push('--cookies', cookieFile);
-        }).catch((e) => {
-          logger.error(`Failed to write cookies file: ${e.message}`);
-        });
-      }
-      const ytdlpProcess = spawn('/opt/venv/bin/yt-dlp', ytdlpArgs, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      ytdlpProcess.on('error', (err) => {
-        logger.error(`yt-dlp spawn error: ${err.message}`);
-        jobs.get(jobId).status = 'failed';
-        jobs.get(jobId).error = `Failed to start download: ${err.message}`;
-        jobs.get(jobId).emitter.emit('update', { status: 'failed', progress: 0, error: err.message });
-        db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', err.message, jobId]);
-        if (cookies) fs.unlink(cookieFile).catch(() => {});
-      });
-
-      ytdlpProcess.on('exit', (code, signal) => {
-        if (code !== 0) {
-          const errorMsg = `Download failed with code ${code}`;
-          logger.error(`yt-dlp exited with code ${code}, signal ${signal}`);
-          jobs.get(jobId).status = 'failed';
-          jobs.get(jobId).error = errorMsg;
-          jobs.get(jobId).emitter.emit('update', { status: 'failed', progress: 0, error: errorMsg });
-          db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', errorMsg, jobId]);
-        }
-        if (cookies) fs.unlink(cookieFile).catch(() => {});
-      });
-
-      const ffmpegArgs = ['-i', 'pipe:0'];
+      const ffmpegArgs = ['-i', streamUrl];
       if (format === 'mp3') {
         ffmpegArgs.push('-f', 'mp3', '-acodec', 'mp3', '-ab', '192k', 'pipe:1');
       } else {
@@ -198,14 +205,21 @@ app.post('/start-download', async (req, res) => {
         db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', err.message, jobId]);
       });
 
-      jobs.get(jobId).ytdlp = ytdlpProcess;
       jobs.get(jobId).ffmpeg = ffmpeg;
       jobs.get(jobId).status = 'downloading';
       db.run('UPDATE jobs SET status = ? WHERE id = ?', ['downloading', jobId]);
 
-      ytdlpProcess.stdout.pipe(ffmpeg.stdin);
+      // Simulate progress (Puppeteer lacks native progress tracking)
+      let progress = 0;
+      const progressInterval = setInterval(() => {
+        progress = Math.min(progress + 10, 90);
+        jobs.get(jobId).progress = progress;
+        jobs.get(jobId).emitter.emit('update', { status: 'downloading', progress });
+        db.run('UPDATE jobs SET progress = ? WHERE id = ?', [progress, jobId]);
+      }, 1000);
 
       ffmpeg.on('close', (code) => {
+        clearInterval(progressInterval);
         if (code === 0) {
           jobs.get(jobId).status = 'complete';
           jobs.get(jobId).progress = 100;
@@ -222,29 +236,6 @@ app.post('/start-download', async (req, res) => {
           db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', `ffmpeg failed with code ${code}`, jobId]);
         }
         setTimeout(() => cleanupJob(jobId), 60000);
-      });
-
-      ytdlpProcess.stderr.on('data', (data) => {
-        const str = data.toString();
-        const match = str.match(/(\d{1,3}\.\d)%/);
-        if (match) {
-          jobs.get(jobId).progress = parseFloat(match[1]);
-          jobs.get(jobId).emitter.emit('update', {
-            status: jobs.get(jobId).status,
-            progress: jobs.get(jobId).progress,
-          });
-          db.run('UPDATE jobs SET progress = ? WHERE id = ?', [jobs.get(jobId).progress, jobId]);
-        }
-        if (str.includes('Sign in to confirm')) {
-          jobs.get(jobId).status = 'failed';
-          jobs.get(jobId).error = 'Authentication required for this video';
-          jobs.get(jobId).emitter.emit('update', {
-            status: 'failed',
-            progress: 0,
-            error: 'Authentication required for this video',
-          });
-          db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', 'Authentication required for this video', jobId]);
-        }
       });
     }
   );
@@ -283,6 +274,11 @@ app.get('/download/:jobId', (req, res) => {
   });
 });
 
+// Browser stats endpoint (for debugging)
+app.get('/browser-stats', (req, res) => {
+  res.json(browserStats);
+});
+
 app.listen(PORT, () => {
-  logger.info(`🚀 Server running on port ${PORT}`);
+  logger.info(`🚀 Server running on port ${PORT} with Puppeteer`);
 });
