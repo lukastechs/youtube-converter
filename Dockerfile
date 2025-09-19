@@ -1,16 +1,19 @@
 FROM node:22-alpine
 
-# Install system dependencies: ffmpeg, python3, py3-pip
+# Install system dependencies: ffmpeg, python3, py3-pip, chromium, and fonts
 RUN apk add --no-cache \
     ffmpeg \
     python3 \
-    py3-pip
+    py3-pip \
+    chromium \
+    fontconfig \
+    ttf-freefont
 
 # Create and activate a Python virtual environment
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install yt-dlp in the virtual environment
+# Install yt-dlp in the virtual environment (as fallback)
 RUN pip install yt-dlp \
     && yt-dlp --version
 
