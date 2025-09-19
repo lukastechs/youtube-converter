@@ -64,7 +64,7 @@ const isValidUrl = (url) => {
 const getTitle = (url) =>
   new Promise((resolve) => {
     const cleanUrl = url.split('&')[0]; // Remove playlist parameters
-    execFile('python3', ['-m', 'yt_dlp', '-j', cleanUrl], (err, stdout, stderr) => {
+    execFile('/opt/venv/bin/yt-dlp', ['-j', cleanUrl], (err, stdout, stderr) => {
       if (err) {
         logger.error(`yt-dlp title fetch error: ${stderr}`);
         return resolve('download');
@@ -123,7 +123,7 @@ app.post('/start-download', async (req, res) => {
         '-',
         cleanUrl,
       ];
-      const ytdlpProcess = spawn('python3', ['-m', 'yt_dlp', ...ytdlpArgs], {
+      const ytdlpProcess = spawn('/opt/venv/bin/yt-dlp', ytdlpArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
@@ -175,6 +175,7 @@ app.post('/start-download', async (req, res) => {
       ffmpeg.on('close', (code) => {
         if (code === 0) {
           jobs.get(jobId).status = 'complete';
+          jobs.get(jobId).progress = 100;
           jobs.get(jobId).emitter.emit('update', { status: 'complete', progress: 100 });
           db.run('UPDATE jobs SET status = ?, progress = ? WHERE id = ?', ['complete', 100, jobId]);
         } else {
