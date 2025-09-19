@@ -19,6 +19,16 @@ const logger = winston.createLogger({
   ],
 });
 
+// Log yt-dlp and ffmpeg versions at startup
+execFile('/opt/venv/bin/yt-dlp', ['--version'], (err, stdout, stderr) => {
+  if (err) logger.error(`yt-dlp version check failed: ${stderr}`);
+  else logger.info(`yt-dlp version: ${stdout.trim()}`);
+});
+execFile('ffmpeg', ['-version'], (err, stdout, stderr) => {
+  if (err) logger.error(`ffmpeg version check failed: ${stderr}`);
+  else logger.info(`ffmpeg version: ${stdout.split('\n')[0].trim()}`);
+});
+
 // Initialize SQLite
 const db = new sqlite3.Database('jobs.db', (err) => {
   if (err) logger.error(`DB connection error: ${err.message}`);
@@ -35,6 +45,11 @@ app.use(rateLimit({ windowMs: 60 * 1000, max: 10 }));
 app.use(express.json());
 
 const jobs = new Map();
+
+// Global error handler to prevent crashes
+process.on('uncaughtException', (err) => {
+  logger.error(`Uncaught Exception: ${err.message}`);
+});
 
 // Cleanup job
 const cleanupJob = (jobId) => {
