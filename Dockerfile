@@ -1,16 +1,17 @@
 FROM node:22-alpine
 
-# Install system dependencies: ffmpeg, curl, python3, build tools
+# Install system dependencies: ffmpeg, python3, pip
 RUN apk add --no-cache \
     ffmpeg \
-    curl \
     python3 \
-    py3-pip \
-    build-base
+    py3-pip
 
-# Download and install yt-dlp standalone binary
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp \
-    && chmod +x /usr/local/bin/yt-dlp
+# Set PATH to include /usr/local/bin
+ENV PATH="/usr/local/bin:$PATH"
+
+# Install yt-dlp via pip for better compatibility
+RUN pip install yt-dlp \
+    && yt-dlp --version
 
 # Set working directory
 WORKDIR /app
