@@ -6,7 +6,6 @@ import { v4 as uuidv4 } from "uuid";
 import { EventEmitter } from "events";
 
 const app = express();
-app.set('trust proxy', 1);  // Trusts the first proxy hop (Render's); use 'true' to trust all
 const PORT = process.env.PORT || 3000;
 
 // CORS: Restrict to your frontend domain in prod
@@ -191,4 +190,4 @@ app.get("/download/:jobId", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-});
+});,
