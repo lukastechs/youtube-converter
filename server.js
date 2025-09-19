@@ -43,7 +43,7 @@ const getTitle = (url) =>
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "YouTube downloader backend running" });
+  res.json({ status: "ok", message: "YouTube MP3/MP4 Downloader backend is running" });
 });
 
 // Start download
