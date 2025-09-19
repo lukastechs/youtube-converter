@@ -3,6 +3,7 @@ import { spawn } from "child_process";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
+import ytdlp from "yt-dlp-exec";
 import { EventEmitter } from "events";
 
 const app = express();
@@ -57,7 +58,7 @@ app.post("/start-download", async (req, res) => {
   jobs.set(jobId, { emitter, status: "initializing", progress: 0, error: null, ytdlp: null, ffmpeg: null, title: "download", format });
 
   // Fetch title async for filename (non-blocking)
-  const getTitle = spawn("yt-dlp", ["--get-title", url]);
+  const getTitle = ytdlp(url, { getTitle: true });
   getTitle.stdout.on("data", (data) => {
     const job = jobs.get(jobId); // Get fresh reference
     if (job) {
