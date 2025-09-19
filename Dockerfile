@@ -1,12 +1,7 @@
-FROM node:22-alpine
+here's my docker FROM node:22-alpine
 
-# Install system dependencies: ffmpeg, curl, python3, build tools
-RUN apk add --no-cache \
-    ffmpeg \
-    curl \
-    python3 \
-    py3-pip \
-    build-base
+# Install system dependencies (ffmpeg via apk, curl for yt-dlp)
+RUN apk add --no-cache ffmpeg curl
 
 # Download and install yt-dlp standalone binary
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp \
@@ -22,7 +17,7 @@ RUN npm install
 # Copy the rest of the code
 COPY . .
 
-# Expose the port
+# Expose the port (optional, Render handles it)
 EXPOSE 3000
 
 # Start the app
