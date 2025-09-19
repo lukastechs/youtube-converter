@@ -3,7 +3,6 @@ import { spawn } from "child_process";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
-import ytdlp from "yt-dlp-exec";
 import { EventEmitter } from "events";
 
 const app = express();
@@ -24,7 +23,7 @@ app.use(limiter);
 app.use(express.json());
 
 // In-memory job store (progress emitters; no storage)
-const jobs = new Map(); // jobId: { emitter: EventEmitter, status: string, progress: number, error: null, ytdlp, ffmpeg, title: string, format: string }
+const jobs = new Map(); // jobId: { emitter: EventEmitter, status: string, progress: number, error: null, ytdlp, ffmpeg }
 
 const cleanupJob = (jobId) => {
   const job = jobs.get(jobId);
@@ -55,30 +54,25 @@ app.post("/start-download", async (req, res) => {
 
   const jobId = uuidv4();
   const emitter = new EventEmitter();
-  jobs.set(jobId, { emitter, status: "initializing", progress: 0, error: null, ytdlp: null, ffmpeg: null, title: "download", format });
+  jobs.set(jobId, { emitter, status: "initializing", progress: 0, error: null, ytdlp: null, ffmpeg: null });
 
   // Fetch title async for filename (non-blocking)
-  const getTitle = ytdlp(url, { getTitle: true });
+  let title = "download";
+  const getTitle = spawn("yt-dlp", ["--get-title", url]);
   getTitle.stdout.on("data", (data) => {
-    const job = jobs.get(jobId); // Get fresh reference
-    if (job) {
-      job.title = data.toString().trim().replace(/[^a-zA-Z0-9 ]/g, "").substring(0, 50);
-      job.emitter.emit("update", { title: job.title }); // Optionally send updated title via SSE
-    }
+    title = data.toString().trim().replace(/[^a-zA-Z0-9 ]/g, "").substring(0, 50);
   });
   getTitle.on("close", (code) => {
+    if (code !== 0) console.error(`Failed to get title for ${jobId}`);
+    // Update status after title fetch
     const job = jobs.get(jobId);
     if (job) {
-      if (code !== 0) {
-        console.error(`Failed to get title for ${jobId}`);
-        job.error = "Failed to fetch title"; // Optional: Set error if critical
-      }
       job.status = "processing";
-      job.emitter.emit("update", { status: job.status, progress: job.progress, error: job.error });
+      job.emitter.emit("update", { status: job.status, progress: job.progress });
     }
   });
 
-  res.json({ jobId, title: jobs.get(jobId).title }); // Return early; processes start in background
+  res.json({ jobId, title }); // Return early; processes start in background
 
   // Start processes in background
   try {
@@ -103,9 +97,6 @@ app.post("/start-download", async (req, res) => {
     const job = jobs.get(jobId);
     job.ytdlp = ytdlp;
     job.ffmpeg = ffmpeg;
-
-    // Critical: Pipe yt-dlp output to ffmpeg input
-    ytdlp.stdout.pipe(ffmpeg.stdin);
 
     // Parse progress from yt-dlp stderr
     ytdlp.stderr.on("data", (data) => {
@@ -153,7 +144,7 @@ app.get("/progress/:jobId", (req, res) => {
   res.setHeader("Connection", "keep-alive");
 
   // Send initial state
-  res.write(`data: ${JSON.stringify({ status: job.status, progress: job.progress, error: job.error, title: job.title })}\n\n`);
+  res.write(`data: ${JSON.stringify({ status: job.status, progress: job.progress, error: job.error })}\n\n`);
 
   // Listener for updates
   const listener = (update) => {
@@ -175,10 +166,11 @@ app.get("/download/:jobId", (req, res) => {
   const job = jobs.get(jobId);
   if (!job || !job.ytdlp || !job.ffmpeg) return res.status(404).json({ error: "Job not found or not started" });
 
-  // Set headers
-  const ext = job.format === "mp4" ? "mp4" : "mp3";
-  const contentType = job.format === "mp4" ? "video/mp4" : "audio/mpeg";
-  res.setHeader("Content-Disposition", `attachment; filename="${job.title}.${ext}"`);
+  // Set headers (assume title is ready; fallback if not)
+  const format = job.format || "mp3"; // You'd need to store format in job if needed
+  const ext = format === "mp4" ? "mp4" : "mp3";
+  const contentType = format === "mp4" ? "video/mp4" : "audio/mpeg";
+  res.setHeader("Content-Disposition", `attachment; filename="${job.title || "download"}.${ext}"`);
   res.setHeader("Content-Type", contentType);
 
   // Pipe the already-running ffmpeg stdout to res
