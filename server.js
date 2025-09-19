@@ -6,6 +6,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
 import sqlite3 from 'sqlite3';
 import winston from 'winston';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -76,21 +78,32 @@ const isValidUrl = (url) => {
 };
 
 // Fetch title using yt-dlp
-const getTitle = (url) =>
-  new Promise((resolve) => {
+const getTitle = (url, cookies) =>
+  new Promise(async (resolve) => {
     const cleanUrl = url.split('&')[0]; // Remove playlist parameters
-    execFile('/opt/venv/bin/yt-dlp', ['-j', cleanUrl], (err, stdout, stderr) => {
+    const args = ['-j', cleanUrl];
+    if (cookies) {
+      const cookieFile = path.join('/tmp', `cookies_${uuidv4()}.txt`);
+      try {
+        await fs.writeFile(cookieFile, cookies);
+        args.push('--cookies', cookieFile);
+      } catch (e) {
+        logger.error(`Failed to write cookies file: ${e.message}`);
+      }
+    }
+    execFile('/opt/venv/bin/yt-dlp', args, async (err, stdout, stderr) => {
+      if (cookies) await fs.unlink(cookieFile).catch(() => {});
       if (err) {
         logger.error(`yt-dlp title fetch error: ${stderr}`);
-        return resolve('download');
+        return resolve({ title: 'download', error: stderr });
       }
       try {
         const info = JSON.parse(stdout);
         const title = info.title?.replace(/[^a-zA-Z0-9 ]/g, '').substring(0, 50) || 'download';
-        resolve(title);
+        resolve({ title, error: null });
       } catch (e) {
         logger.error(`JSON parse error: ${e.message}`);
-        resolve('download');
+        resolve({ title: 'download', error: e.message });
       }
     });
   });
@@ -102,7 +115,7 @@ app.get('/', (req, res) => {
 
 // Start download
 app.post('/start-download', async (req, res) => {
-  const { url, format: reqFormat } = req.body;
+  const { url, format: reqFormat, cookies } = req.body;
   const format = (reqFormat || 'mp3').toLowerCase();
 
   if (!isValidUrl(url)) return res.status(400).json({ error: 'Invalid YouTube URL' });
@@ -110,11 +123,9 @@ app.post('/start-download', async (req, res) => {
 
   const jobId = uuidv4();
   const emitter = new EventEmitter();
-  let title = 'download';
-  try {
-    title = await getTitle(url);
-  } catch (err) {
-    logger.error(`Title fetch failed: ${err.message}`);
+  const { title, error: titleError } = await getTitle(url, cookies);
+  if (titleError && titleError.includes('Sign in to confirm')) {
+    return res.status(403).json({ error: 'Authentication required. Please provide valid YouTube cookies.' });
   }
 
   db.run(
@@ -138,6 +149,14 @@ app.post('/start-download', async (req, res) => {
         '-',
         cleanUrl,
       ];
+      if (cookies) {
+        const cookieFile = path.join('/tmp', `cookies_${uuidv4()}.txt`);
+        fs.writeFile(cookieFile, cookies).then(() => {
+          ytdlpArgs.push('--cookies', cookieFile);
+        }).catch((e) => {
+          logger.error(`Failed to write cookies file: ${e.message}`);
+        });
+      }
       const ytdlpProcess = spawn('/opt/venv/bin/yt-dlp', ytdlpArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -148,20 +167,19 @@ app.post('/start-download', async (req, res) => {
         jobs.get(jobId).error = `Failed to start download: ${err.message}`;
         jobs.get(jobId).emitter.emit('update', { status: 'failed', progress: 0, error: err.message });
         db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', err.message, jobId]);
+        if (cookies) fs.unlink(cookieFile).catch(() => {});
       });
 
       ytdlpProcess.on('exit', (code, signal) => {
         if (code !== 0) {
+          const errorMsg = `Download failed with code ${code}`;
           logger.error(`yt-dlp exited with code ${code}, signal ${signal}`);
           jobs.get(jobId).status = 'failed';
-          jobs.get(jobId).error = `Download failed with code ${code}`;
-          jobs.get(jobId).emitter.emit('update', {
-            status: 'failed',
-            progress: 0,
-            error: `Download failed with code ${code}`,
-          });
-          db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', `Download failed with code ${code}`, jobId]);
+          jobs.get(jobId).error = errorMsg;
+          jobs.get(jobId).emitter.emit('update', { status: 'failed', progress: 0, error: errorMsg });
+          db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', errorMsg, jobId]);
         }
+        if (cookies) fs.unlink(cookieFile).catch(() => {});
       });
 
       const ffmpegArgs = ['-i', 'pipe:0'];
@@ -216,6 +234,16 @@ app.post('/start-download', async (req, res) => {
             progress: jobs.get(jobId).progress,
           });
           db.run('UPDATE jobs SET progress = ? WHERE id = ?', [jobs.get(jobId).progress, jobId]);
+        }
+        if (str.includes('Sign in to confirm')) {
+          jobs.get(jobId).status = 'failed';
+          jobs.get(jobId).error = 'Authentication required for this video';
+          jobs.get(jobId).emitter.emit('update', {
+            status: 'failed',
+            progress: 0,
+            error: 'Authentication required for this video',
+          });
+          db.run('UPDATE jobs SET status = ?, error = ? WHERE id = ?', ['failed', 'Authentication required for this video', jobId]);
         }
       });
     }
