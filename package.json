@@ -1,5 +1,5 @@
 {
-  "name": "youtube-mp3-downloader",
+  "name": "youtube-converter",
   "version": "1.0.0",
   "description": "Stream YouTube audio/video as MP3/MP4 via yt-dlp + ffmpeg",
   "main": "server.js",
