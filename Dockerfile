@@ -1,4 +1,4 @@
-here's my docker FROM node:22-alpine
+FROM node:22-alpine
 
 # Install system dependencies (ffmpeg via apk, curl for yt-dlp)
 RUN apk add --no-cache ffmpeg curl
